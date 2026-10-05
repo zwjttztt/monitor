@@ -1,0 +1,61 @@
+# monitor hub —— 源码构建镜像的部署示例
+#
+#   docker compose up -d
+#
+# 镜像需要自己先构建（这个仓库的 Dockerfile 只吃 CI 产出的二进制，源码走
+# Dockerfile.source）：
+#
+#   docker build -f Dockerfile.source -t monitor-hub:local .
+#
+# 数据全在 /data 里，命名卷 monitor-data 挂在那儿：数据库、主题目录、备份都
+# 在里面。删卷等于删数据，docker compose down 不会。
+
+services:
+  monitor:
+    build:
+      # 见上：预编译二进制那条路在这个仓库里走不通，得指定 Dockerfile.source。
+      context: .
+      dockerfile: Dockerfile.source
+    image: monitor-hub:local
+    container_name: monitor
+    restart: unless-stopped
+    ports:
+      # 只在宿主机回环上开，公网进来要靠反向代理 —— 面板密码和 agent token
+      # 不该在链路上裸奔。删掉这行则直接监听 0.0.0.0:28080，仅适合内网。
+      - "127.0.0.1:28080:28080"
+    volumes:
+      - monitor-data:/data
+      # 反代在另一台机器上时，把证书挂进来；反代与 hub 同机则用 127.0.0.1 那行即可。
+      # - ./tls:/etc/nginx/tls:ro
+    environment:
+      # 镜像里默认 UTC。流量和账期都以本地日期为界，跨时区看面板会对不上账。
+      # chrono 的 Local 直接读这个变量，zoneinfo 也已打进镜像。
+      TZ: Asia/Shanghai
+      # 日志级别，如 monitor_hub=debug,tower_http=debug
+      # MONITOR_LOG: monitor_hub=info,tower_http=warn
+    # hub 没有 SITE 环境变量，--site 只能走命令行。三种情况需要它：节点连的
+    # 域名与进面板的域名不同；通过 SSH 隧道进面板（回环地址节点够不着）；
+    # 反代不发 X-Forwarded-Proto（这时会话 cookie 拿不到 Secure 标志）。
+    # 必须是 https:// 开头的域名，填错会导致无法添加节点。
+    # command:
+    #   - /monitor-hub
+    #   - --db
+    #   - /data/monitor.db
+    #   - --site
+    #   - https://monitor.example.com
+    # 镜像里没有 shell，容器内无法 exec，也没有 curl：/monitor-hub 自己带
+    # --help，打印版本后 exit(0)，是这里唯一能用的探针。
+    healthcheck:
+      test: ["CMD", "/monitor-hub", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # hub 常驻内存很小，给 256M 足够；SQLite 的 page cache 算在其中。
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+volumes:
+  monitor-data:

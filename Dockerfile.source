@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+
+# 从源码构建 hub 镜像。
+#
+# 仓库根的 Dockerfile 吃的是 release.yml 产出的两个 musl 二进制，根 .dockerignore
+# 也只把它们放进构建上下文 —— 从源码构建走的是这个文件，配合同名的
+# Dockerfile.source.dockerignore 放开源码，两者互不影响。
+#
+# 产物与发布镜像同构：scratch + 静态 musl 二进制，只有 /data 可写。
+
+# ---- 面板 ----
+# rust-embed 嵌的是 web-admin/dist，所以面板必须先于 cargo 构建完。
+FROM node:24-alpine AS panel
+WORKDIR /src/web-admin
+# 先只拷锁文件：依赖层因此与源码层分开，改前端代码不会重装依赖。
+COPY web-admin/package.json web-admin/package-lock.json ./
+RUN npm ci
+COPY web-admin/ ./
+# tsc -b && vite build
+RUN npm run build
+
+# ---- 时区数据 ----
+# 固定在构建平台：zoneinfo 与架构无关，两平台构建因此不需要 QEMU。
+FROM --platform=$BUILDPLATFORM alpine:3 AS tzdata
+# 日界与账期边界是本地日期（db.rs），而 chrono 在缺 zone 文件时会静默退回
+# UTC。少了这一步，流量和到期都会在错误的时刻翻页。
+RUN apk add --no-cache tzdata && mkdir -p /data
+
+# ---- hub 二进制 ----
+# alpine 版的 rust 镜像 host 本身就是 musl 目标，不需要 cross，也不用
+# rustup target add：cargo build 直接产出静态二进制。
+FROM rust:1-alpine AS hub
+# musl-dev 给出编译 bundled SQLite 用的 C 编译器；curl 给 build.rs 调
+# scripts/theme.sh 取默认主题用 —— 缺了它 rust-embed 会嵌进一个空主题。
+RUN apk add --no-cache musl-dev curl
+WORKDIR /src
+COPY Cargo.toml Cargo.lock build.rs rustfmt.toml web-theme.pin ./
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+# 路径由 rust-embed 的 folder = "web-admin/dist" 决定，必须在 cargo 运行前就位，
+# 否则报 "folder does not exist" 并连带 AdminAssets: Embed 失败。
+COPY --from=panel /src/web-admin/dist ./web-admin/dist
+RUN cargo build --release --locked
+
+# ---- 运行时 ----
+FROM scratch
+# 镜像里没有 shell，hub 以非特权用户运行，/data 已经在镜像里建好并归属正确：
+# 容器内没有任何东西能 mkdir。
+COPY --from=tzdata /usr/share/zoneinfo /usr/share/zoneinfo
+ENV TZ=UTC
+COPY --from=tzdata --chown=65534:65534 /data /data
+# 静态 musl 二进制，权限由 stage 之间保留，无需 --chmod。
+COPY --from=hub /src/target/release/monitor-hub /monitor-hub
+USER 65534:65534
+
+EXPOSE 28080
+ENTRYPOINT ["/monitor-hub", "--db", "/data/monitor.db"]

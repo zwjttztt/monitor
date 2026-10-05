@@ -1,0 +1,19 @@
+# Dockerfile.source 的构建上下文：整棵源码树。
+#
+# `docker build -f Dockerfile.source .` 会优先读这个文件，根 .dockerignore
+# （只放行 release.yml 产出的 monitor-hub-amd64 / monitor-hub-arm64）因此不受影响，
+# 发布流程的构建上下文依旧是那两个二进制。
+#
+# 规则自上而下逐条应用，最后一条匹配的文件生效，所以 node_modules / dist 虽被
+# 包含又在最后被排除。
+*
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!rustfmt.toml
+!web-theme.pin
+!src/
+!scripts/
+!web-admin/
+web-admin/node_modules/
+web-admin/dist/
