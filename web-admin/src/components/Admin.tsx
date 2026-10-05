@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useId, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
+import { ArrowUpCircle, Bell, CalendarClock, Check, ChevronDown, ChevronRight, CircleQuestionMark, Copy, Database, Download, GripVertical, Layers, Palette, Pencil, Plus, Radio, RefreshCw, RotateCcw, Search, Send, Server, Settings, Shield, SlidersHorizontal, Trash2, Upload } from "lucide-react"
 import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
@@ -15,7 +15,7 @@ import { Switch } from "@/components/ui/switch"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { api, badIfaceName, behind, changes, configFields, configForm, configOverrides, configSections, configValues, currentIface, fits, GIB, groupsOf, ifaceChoice, ifaceSpec, inGroup, outdatedAgents, provisioningSite, shortAddress, trafficCorrection, upload, type ConfigField, type IfaceChoice, type Node, type PingTask, type Source } from "@/lib/api"
-import { bytes, cycleMonths, FOREVER, money, uptime } from "@/lib/format"
+import { bytes, cycleMonths, expiryText, FOREVER, fromDatetimeLocal, money, toDatetimeLocal, uptime } from "@/lib/format"
 
 // Counters the panel can correct after migration or an accounting error.
 const TRAFFIC_FIELDS = [
@@ -1038,10 +1038,19 @@ function BillingForm({ node, onClose, onSaved }: {
                   </Select>
                 </div>
               </Field>
-              <Field label="到期时间">
-                <Input type="date" value={form.expires_at ?? ""} onChange={(e) => set("expires_at", e.target.value)} />
-              </Field>
             </div>
+            {/* Its own row: a date and a time do not share a half-width
+                column with a number and its unit. To the minute, so renewing
+                a monthly plan due at 08:32 keeps it due at 08:32. The hub
+                stores the two with a space between them; the input speaks
+                ISO. */}
+            <Field label="到期时间" hint="精确到分钟，留空为长期">
+              <Input
+                type="datetime-local"
+                value={toDatetimeLocal(form.expires_at)}
+                onChange={(e) => set("expires_at", fromDatetimeLocal(e.target.value))}
+              />
+            </Field>
           </div>
           <DialogFooter>
             <Button type="button" variant="ghost" onClick={onClose}>取消</Button>
@@ -1437,6 +1446,8 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
   const reg = useRegisterWindow()
   const [deleting, setDeleting] = useState<Node | null>(null)
   const [removing, setRemoving] = useState(false)
+  // Which row's renewal is in flight, so only that button shows it.
+  const [renewing, setRenewing] = useState<number | null>(null)
   const [query, setQuery] = useState("")
   const [group, setGroup] = useGroupFilter(nodes)
   const [grouping, setGrouping] = useState(false)
@@ -1466,6 +1477,22 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
       toast.error((e as Error).message)
     } finally {
       setRemoving(false)
+    }
+  }
+
+  // One more cycle, counted by the node's own plan: the hub answers with the
+  // date it landed on, which is worth showing back, since that is the whole
+  // point of pressing it.
+  async function renew(node: Node) {
+    setRenewing(node.id)
+    try {
+      const { expires_at } = await api<{ expires_at: string }>(`/nodes/${node.id}/renew`, { method: "POST" })
+      toast.success(`${node.name} 已续费，到期时间 ${expires_at}`)
+      refresh()
+    } catch (e) {
+      toast.error((e as Error).message)
+    } finally {
+      setRenewing(null)
     }
   }
 
@@ -1585,9 +1612,9 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                 </TableCell>
                 <TableCell className="tnum text-sm">
                   {n.price > 0 ? money(n.price, n.currency) : "免费"}
-                  <div className="text-xs text-muted-foreground xl:hidden">{n.expires_at || FOREVER}</div>
+                  <div className="text-xs text-muted-foreground xl:hidden">{expiryText(n.expires_at, FOREVER)}</div>
                 </TableCell>
-                <TableCell className="hidden text-sm xl:table-cell">{n.expires_at || FOREVER}</TableCell>
+                <TableCell className="hidden text-sm xl:table-cell">{expiryText(n.expires_at, FOREVER)}</TableCell>
                 <TableCell className="text-right whitespace-nowrap">
                   <Button variant="ghost" size="icon" disabled={!!refusal} onClick={() => setInstalling(n)} title="安装 Agent" aria-label="安装 Agent">
                     <Download />
@@ -1597,6 +1624,19 @@ function Nodes({ nodes, refresh, site, refusal }: { nodes: Node[]; refresh: () =
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setBilling(n)} title="续费设置" aria-label="续费设置">
                     <CalendarClock />
+                  </Button>
+                  {/* Off on a one-off plan, which has no cycle to add: the hub
+                      refuses it, and a button that only ever complains is worse
+                      than one that says so up front. */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    disabled={renewing === n.id || n.billing_cycle === "once"}
+                    onClick={() => renew(n)}
+                    title={n.billing_cycle === "once" ? "一次性付款没有周期可续" : "已续费，顺延一个付款周期"}
+                    aria-label="已续费"
+                  >
+                    <RotateCcw className={renewing === n.id ? "animate-spin" : undefined} />
                   </Button>
                   <Button variant="ghost" size="icon" onClick={() => setDeleting(n)} title="删除节点" aria-label="删除节点">
                     <Trash2 className="text-destructive" />

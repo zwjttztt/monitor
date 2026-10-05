@@ -64,3 +64,32 @@ const NAMED_CYCLES: Record<string, number> = { monthly: 1, quarterly: 3, semiann
 export function cycleMonths(cycle: string): number {
   return cycle === "once" ? 0 : NAMED_CYCLES[cycle] ?? Number(/^(\d+)m$/.exec(cycle)?.[1])
 }
+
+/**
+ * An expiry as the hub stores it, `2026-01-10 08:32`, as the datetime input
+ * wants it, `2026-01-10T08:32`. A bare date, which every hub before 1.4 wrote,
+ * is read as midnight.
+ */
+export function toDatetimeLocal(value: string | null): string {
+  if (!value) return ""
+  const [date, time] = value.trim().split(/[ T]/)
+  if (!date) return ""
+  return `${date}T${(time ?? "00:00").slice(0, 5)}`
+}
+
+/** Back the other way, dropping the seconds a browser may add. */
+export function fromDatetimeLocal(value: string): string | null {
+  const at = value.trim().replace("T", " ")
+  return at ? at.slice(0, 16) : null
+}
+
+/**
+ * An expiry for a table cell: the date and, where one was kept, the time of
+ * day. A date alone is left as it is, so a node entered before minute expiry
+ * reads the way it always did.
+ */
+export function expiryText(value: string | null, forever: string): string {
+  if (!value) return forever
+  const [date, time] = value.trim().split(" ")
+  return time ? `${date} ${time.slice(0, 5)}` : date
+}

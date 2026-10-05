@@ -16,7 +16,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use chrono::{DateTime, Local, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -451,25 +451,27 @@ pub fn expiry_digest(app: &App, now: DateTime<Local>) -> Result<Option<Note>> {
     {
         return Ok(None);
     }
-    let mut soon: Vec<(NaiveDate, String)> = app
+    let mut soon: Vec<(NaiveDateTime, String)> = app
         .db
         .nodes()?
         .into_iter()
         .filter_map(|n| {
-            let date = n.expires_at.as_deref()?.parse::<NaiveDate>().ok()?;
-            (0..=days).contains(&(date - today).num_days()).then_some((date, n.name))
+            // To the minute, which is how far the renewal the notice asks for
+            // would carry the node. The window is still counted in days.
+            let at = n.expires_at.as_deref().and_then(crate::parse_expiry)?;
+            (0..=days).contains(&(at.date() - today).num_days()).then_some((at, n.name))
         })
         .collect();
     soon.sort();
     app.db.set("notify_expiry_sent", &today.to_string())?;
     let items = soon
         .iter()
-        .map(|(date, name)| {
-            let left = match (*date - today).num_days() {
+        .map(|(at, name)| {
+            let left = match (at.date() - today).num_days() {
                 0 => "今天到期".into(),
                 d => format!("还剩 {d} 天"),
             };
-            (name.as_str(), format!("{date} {left}"))
+            (name.as_str(), format!("{} {left}", crate::format_expiry(*at)))
         })
         .collect();
     Ok(batch("expiry", "⏳", "即将到期", items))
@@ -930,7 +932,22 @@ mod tests {
         with_channel(&app);
         let note = expiry_digest(&app, at(9)).unwrap().unwrap();
         assert_eq!(note.title, "⏳ 2 台节点即将到期");
-        assert_eq!(note.message, "today · 2026-09-15 今天到期\nsoon · 2026-09-20 还剩 5 天");
+        // The expiry is quoted to the minute. A bare date, which is what these
+        // were entered as, is still read: as midnight of that day.
+        assert_eq!(note.message, "today · 2026-09-15 00:00 今天到期\nsoon · 2026-09-20 00:00 还剩 5 天");
         assert!(expiry_digest(&app, at(10)).unwrap().is_none(), "once per day");
+    }
+
+    /// A minute is part of the date the digest quotes, so a node due at 08:32
+    /// does not read as one due at midnight.
+    #[test]
+    fn the_expiry_digest_quotes_the_time_of_day() {
+        let app = app();
+        let id = node(&app, "due", false, 0);
+        app.db.set_expiry(id, "2026-09-16 08:32").unwrap();
+        with_channel(&app);
+        let note = expiry_digest(&app, Local.with_ymd_and_hms(2026, 9, 15, 9, 0, 0).unwrap()).unwrap().unwrap();
+        // One node is not a list, so the message is the detail alone.
+        assert_eq!(note.message, "2026-09-16 08:32 还剩 1 天");
     }
 }

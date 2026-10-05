@@ -228,7 +228,10 @@ fn node_view(node: &Node, current: Option<&Agent>, traffic: &Traffic, full: bool
         // on the visitor's clock would, with the hub on UTC and the visitor on
         // UTC+8, show every online node expired for eight hours each cycle
         // before the hub rolls its date forward.
-        "expires_in": node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()).map(|d| (d - today).num_days()),
+        // Whole days, as a visitor reads them: an expiry at 08:32 is due that
+        // day, whatever hour it is now. The minutes themselves are in
+        // `expires_at`, for whoever needs them.
+        "expires_in": node.expires_at.as_deref().and_then(crate::parse_expiry).map(|d| (d.date() - today).num_days()),
         "traffic_limit": node.traffic_limit,
         "traffic_mode": node.traffic_mode,
         "traffic_reset_day": node.traffic_reset_day,
@@ -711,6 +714,22 @@ fn billing_error(currency: Option<&mut String>, cycle: Option<&mut String>) -> O
     None
 }
 
+/// Rewrites an expiry in the one stored spelling, or names it when neither a
+/// date nor a date with a time to the minute can be read out of it.
+///
+/// Refused rather than stored: a value no reader recognizes would leave the node
+/// silently never due, which is the one way an expiry can fail quietly. The
+/// rewriting is what keeps the panel's own input and the ISO form a browser
+/// posts from disagreeing about what was saved.
+fn expiry_error(expires: &mut Option<String>) -> Option<&'static str> {
+    let Some(stored) = expires.as_mut() else { return None };
+    let Some(at) = crate::parse_expiry(stored) else {
+        return Some("到期时间要写成 2026-01-10 08:32，也可以只写日期 2026-01-10");
+    };
+    *stored = crate::format_expiry(at);
+    None
+}
+
 /// Normalizes a patch, or names the first value that cannot be stored. The one
 /// check both the single and the batch write pass through, so the two accept
 /// exactly the same values.
@@ -731,6 +750,11 @@ fn patch_error(node: &mut NodePatch) -> Option<&'static str> {
         *text = text.trim().to_owned();
         if text.chars().count() > MAX_PUBLIC_REMARK || text.chars().any(char::is_control) {
             return Some("公开备注最多 100 个字，不能含控制字符");
+        }
+    }
+    if let Some(expires) = node.expires_at.as_mut() {
+        if let Some(message) = expiry_error(expires) {
+            return Some(message);
         }
     }
     node_limits(node.traffic_reset_day, node.price, node.traffic_limit)
@@ -806,6 +830,7 @@ pub async fn create_node(
         node_limits(Some(node.traffic_reset_day), Some(node.price), Some(node.traffic_limit))
             .or_else(|| group_error(&mut node.group))
             .or_else(|| billing_error(Some(&mut node.currency), Some(&mut node.billing_cycle)))
+            .or_else(|| expiry_error(&mut node.expires_at))
     {
         return bad(message);
     }
@@ -1076,6 +1101,36 @@ pub async fn delete_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64
     app.readings.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     invalidate_snapshot(&app);
     Json(json!({"ok": true})).into_response()
+}
+
+/// Extends a node's expiry by one billing cycle, at the press of a button.
+///
+/// The time of day is carried over, so a node paid for until 10 January 08:32
+/// is next due 10 February 08:32 on a monthly plan. A node already past due, or
+/// one with no expiry yet, is renewed from now instead: a cycle counted from a
+/// date in the past would only leave it overdue again, and one counted from
+/// nothing has nowhere to start.
+pub async fn renew_node(_: Admin, State(app): State<Shared>, Path(id): Path<i64>) -> Response {
+    let node = match app.db.node(id) {
+        Ok(Some(node)) => node,
+        Ok(None) => return no_such_node(),
+        Err(e) => return fail(e),
+    };
+    if node.billing_cycle == "once" {
+        return bad("一次性付款没有周期，直接改到期时间");
+    }
+    let now = Local::now().naive_local();
+    let due = node.expires_at.as_deref().and_then(crate::parse_expiry).filter(|at| *at > now).unwrap_or(now);
+    let Some(next) = crate::extend_by_cycle(due, &node.billing_cycle) else {
+        return bad("付款周期不是整月，先改好周期再续费");
+    };
+    let stored = crate::format_expiry(next);
+    if let Err(e) = app.db.set_expiry(id, &stored) {
+        return fail(e);
+    }
+    // The expiry is part of the admin frame and of the public page.
+    invalidate_snapshot(&app);
+    Json(json!({"expires_at": stored})).into_response()
 }
 
 /// Issues a fresh token, invalidating the old one immediately.
@@ -2903,6 +2958,41 @@ mod tests {
         }
     }
 
+    /// A renewal adds one cycle to the date the node is already due on, at the
+    /// same time of day: monthly and due 10 January at 08:32, it is next due
+    /// 10 February at 08:32.
+    #[tokio::test]
+    async fn renewing_adds_one_cycle_at_the_same_time_of_day() {
+        let app = std::sync::Arc::new(app());
+        let state = || axum::extract::State(app.clone());
+        let id = node(&app, "n", true);
+        let cycle = |c: &str| -> NodePatch { serde_json::from_value(json!({"billing_cycle": c})).unwrap() };
+        app.db.update_node(id, &cycle("monthly")).unwrap();
+        app.db.set_expiry(id, "2030-01-10 08:32").unwrap();
+
+        assert_eq!(renew_node(Admin, state(), Path(id)).await.status(), StatusCode::OK);
+        assert_eq!(app.db.node(id).unwrap().unwrap().expires_at.as_deref(), Some("2030-02-10 08:32"));
+
+        // A quarter at a time, counted from the date the last one landed on.
+        app.db.update_node(id, &cycle("quarterly")).unwrap();
+        assert_eq!(renew_node(Admin, state(), Path(id)).await.status(), StatusCode::OK);
+        assert_eq!(app.db.node(id).unwrap().unwrap().expires_at.as_deref(), Some("2030-05-10 08:32"));
+    }
+
+    /// One-off billing has no cycle to add, so it is refused rather than given
+    /// a length of the hub's choosing.
+    #[tokio::test]
+    async fn a_one_off_plan_is_not_renewed() {
+        let app = std::sync::Arc::new(app());
+        let id = node(&app, "n", true);
+        let patch: NodePatch = serde_json::from_value(json!({"billing_cycle": "once"})).unwrap();
+        app.db.update_node(id, &patch).unwrap();
+
+        let response = renew_node(Admin, axum::extract::State(app.clone()), Path(id)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(app.db.node(id).unwrap().unwrap().expires_at, None, "nothing was written");
+    }
+
     /// A write naming a node that no longer exists, such as one deleted from
     /// another tab, is refused rather than reported as saved.
     #[tokio::test]
@@ -2913,6 +3003,7 @@ mod tests {
         assert_eq!(update_node(Admin, state(), Path(9), patch).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(delete_node(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(reset_token(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(renew_node(Admin, state(), Path(9)).await.status(), StatusCode::NOT_FOUND);
         let traffic = Json(TrafficPatch { total_rx: Some(1), ..Default::default() });
         assert_eq!(patch_traffic(Admin, state(), Path(9), traffic).await.status(), StatusCode::NOT_FOUND);
     }

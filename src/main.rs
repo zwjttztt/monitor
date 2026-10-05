@@ -42,7 +42,7 @@ use axum::http::{header, Extensions, HeaderMap, StatusCode, Version};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
-use chrono::{DateTime, Local, Months, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Local, Months, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use tokio::signal::unix::{signal, SignalKind};
 use tower_http::compression::Predicate;
 use tracing::{info, warn};
@@ -503,6 +503,7 @@ async fn main() -> Result<()> {
         .route("/api/nodes/batch", put(api::update_nodes))
         .route("/api/nodes/{id}", put(api::update_node).delete(api::delete_node))
         .route("/api/nodes/{id}/token", post(api::reset_token))
+        .route("/api/nodes/{id}/renew", post(api::renew_node))
         .route("/api/nodes/{id}/traffic", put(api::patch_traffic))
         .route("/api/ping-tasks", get(api::ping_tasks).post(api::save_ping_task))
         .route("/api/ping-tasks/order", put(api::reorder_ping_tasks))
@@ -734,22 +735,51 @@ fn cycle_name(months: u32) -> String {
         .map_or_else(|| format!("{months}m"), |(name, _)| (*name).into())
 }
 
-/// A node still reporting past its expiry date has been renewed, so the date is
-/// rolled forward by whole cycles until it lies in the future.
-fn renewed(expires: NaiveDate, cycle: &str, today: NaiveDate) -> Option<NaiveDate> {
+/// An expiry as `node.expires_at` holds it, in the hub's own timezone.
+///
+/// A time of day is part of it since 1.4: a plan paid for until 10 January
+/// 08:32 ends then, not at midnight, and the minutes are what a renewal carries
+/// forward. Every hub before that wrote a bare date, which is still read, as
+/// midnight of that day. `None` when the string is neither.
+pub fn parse_expiry(stored: &str) -> Option<NaiveDateTime> {
+    let s = stored.trim();
+    // The `T` of the ISO form and the space of the stored one; both reach the
+    // hub, the first from a browser's datetime input before it is rewritten.
+    for format in ["%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(at) = NaiveDateTime::parse_from_str(s, format) {
+            return Some(at);
+        }
+    }
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()?.and_hms_opt(0, 0, 0)
+}
+
+/// How an expiry is stored: to the minute, which is as fine as it is entered.
+pub fn format_expiry(at: NaiveDateTime) -> String {
+    at.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// A node still reporting past its expiry has been renewed, so it is rolled
+/// forward by whole cycles until it lies in the future. The time of day comes
+/// along: one paid for until the 10th at 08:32 stays due at 08:32.
+fn renewed(expires: NaiveDateTime, cycle: &str, now: NaiveDateTime) -> Option<NaiveDateTime> {
     let months = Months::new(cycle_months(cycle)?);
     let mut next = expires;
-    while next < today {
+    while next < now {
         next = next.checked_add_months(months)?;
     }
     (next != expires).then_some(next)
+}
+
+/// One more cycle from `now`, kept for the panel's renew button.
+pub fn extend_by_cycle(at: NaiveDateTime, cycle: &str) -> Option<NaiveDateTime> {
+    at.checked_add_months(Months::new(cycle_months(cycle)?))
 }
 
 fn renew_online_nodes(app: &App) -> Result<()> {
     // The hub's local timezone, as with the traffic boundaries: an expiry date
     // is one a person entered, and on a UTC+8 hub `Utc` reports the previous day
     // until 08:00 while the panel already shows it expired.
-    let today = Local::now().date_naive();
+    let now = Local::now().naive_local();
     let online: Vec<i64> = app.agents.read().unwrap_or_else(|e| e.into_inner()).keys().copied().collect();
     let nodes = app.db.nodes()?;
     let mut rolled = Vec::new();
@@ -757,13 +787,12 @@ fn renew_online_nodes(app: &App) -> Result<()> {
         if !online.contains(&node.id) {
             continue;
         }
-        let Some(expires) = node.expires_at.as_deref().and_then(|d| d.parse::<NaiveDate>().ok()) else {
-            continue;
-        };
-        let Some(next) = renewed(expires, &node.billing_cycle, today) else { continue };
-        app.db.set_expiry(node.id, &next.to_string())?;
-        info!("node {} is still up past {expires}, expiry rolled to {next}", node.name);
-        rolled.push((node.name.as_str(), format!("{expires} → {next}")));
+        let Some(expires) = node.expires_at.as_deref().and_then(parse_expiry) else { continue };
+        let Some(next) = renewed(expires, &node.billing_cycle, now) else { continue };
+        app.db.set_expiry(node.id, &format_expiry(next))?;
+        let (was, now_due) = (format_expiry(expires), format_expiry(next));
+        info!("node {} is still up past {was}, expiry rolled to {now_due}", node.name);
+        rolled.push((node.name.as_str(), format!("{was} → {now_due}")));
     }
     notify::renewed(app, rolled);
     Ok(())
@@ -858,16 +887,41 @@ mod tests {
 
     #[test]
     fn an_expired_node_that_is_still_up_rolls_forward_whole_cycles() {
-        let d = |s: &str| s.parse::<NaiveDate>().unwrap();
-        // One day past a monthly expiry: the next month, clamped to its end.
-        assert_eq!(renewed(d("2026-01-31"), "monthly", d("2026-02-01")), Some(d("2026-02-28")));
+        let d = |s: &str| parse_expiry(s).unwrap();
+        // One day past a monthly expiry: the next month, clamped to its end,
+        // and the time of day it was due at.
+        assert_eq!(
+            renewed(d("2026-01-31T08:32"), "monthly", d("2026-02-01T00:00")),
+            Some(d("2026-02-28T08:32"))
+        );
         // Years overdue: cycles are added until the date is in the future.
-        assert_eq!(renewed(d("2024-03-10"), "yearly", d("2026-08-28")), Some(d("2027-03-10")));
+        assert_eq!(renewed(d("2024-03-10T00:00"), "yearly", d("2026-08-28T00:00")), Some(d("2027-03-10T00:00")));
         // A length without a name rolls the same way.
-        assert_eq!(renewed(d("2026-03-10"), "60m", d("2026-08-28")), Some(d("2031-03-10")));
+        assert_eq!(renewed(d("2026-03-10T00:00"), "60m", d("2026-08-28T00:00")), Some(d("2031-03-10T00:00")));
+        // A minute short of the hour it is due at, the node is not yet overdue.
+        assert_eq!(renewed(d("2026-08-28T09:00"), "monthly", d("2026-08-28T08:59")), None);
         // Not yet due, and one-off billing: both left unchanged.
-        assert_eq!(renewed(d("2026-09-01"), "monthly", d("2026-08-28")), None);
-        assert_eq!(renewed(d("2020-01-01"), "once", d("2026-08-28")), None);
+        assert_eq!(renewed(d("2026-09-01T00:00"), "monthly", d("2026-08-28T00:00")), None);
+        assert_eq!(renewed(d("2020-01-01T00:00"), "once", d("2026-08-28T00:00")), None);
+    }
+
+    #[test]
+    fn a_stored_expiry_is_read_to_the_minute() {
+        // Every spelling the hub or a browser writes, and a bare date, which is
+        // what the hubs before 1.4 left behind.
+        for (stored, want) in [
+            ("2026-01-10 08:32", "2026-01-10 08:32"),
+            ("2026-01-10T08:32", "2026-01-10 08:32"),
+            ("2026-01-10T08:32:00", "2026-01-10 08:32"),
+            (" 2026-01-10 08:32 ", "2026-01-10 08:32"),
+            ("2026-01-10", "2026-01-10 00:00"),
+        ] {
+            assert_eq!(parse_expiry(stored).map(format_expiry), Some(want.into()), "{stored}");
+        }
+        // Neither a date nor one with a time: not an expiry at all.
+        for stored in ["", "10/01/2026", "2026-01-10 08", "明天"] {
+            assert_eq!(parse_expiry(stored), None, "{stored}");
+        }
     }
 
     /// The hour is the local one, which in a half-hour zone is not UTC's.
