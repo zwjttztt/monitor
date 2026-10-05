@@ -34,7 +34,10 @@ FROM rust:1-alpine AS hub
 # scripts/theme.sh 取默认主题用 —— 缺了它 rust-embed 会嵌进一个空主题。
 RUN apk add --no-cache musl-dev curl
 WORKDIR /src
-COPY Cargo.toml Cargo.lock build.rs rustfmt.toml web-theme.pin ./
+# install.sh 不是可选文件：hub 用 include_str!("../install.sh") 把它嵌进
+# /install.sh 路由，面板生成 agent 安装命令时靠它。漏掉会在编译期报
+# "couldn't read src/../install.sh"。
+COPY Cargo.toml Cargo.lock build.rs rustfmt.toml web-theme.pin install.sh ./
 COPY src/ ./src/
 COPY scripts/ ./scripts/
 # 路径由 rust-embed 的 folder = "web-admin/dist" 决定，必须在 cargo 运行前就位，

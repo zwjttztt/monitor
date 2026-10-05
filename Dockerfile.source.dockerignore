@@ -12,6 +12,7 @@
 !build.rs
 !rustfmt.toml
 !web-theme.pin
+!install.sh
 !src/
 !scripts/
 !web-admin/

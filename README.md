@@ -52,13 +52,16 @@ git clone https://github.com/zwjttztt/monitor.git
 cd monitor
 
 # 构建。慢在 cargo：235 个依赖，且 release profile 开了 lto + codegen-units=1。
-# 2 核小机器上实测 1.5 小时以上，官方 runner 约 10 分钟。Docker 层有缓存，
-# 第二次只重跑改动之后的阶段。
+# 官方 runner 约 10 分钟；2 核 1GB 内存的小机器实测 **2.5 小时**（其中链接
+# monitor-hub 本体就要 40 多分钟）。Docker 层有缓存，改代码后只重跑受影响阶段。
 docker build -f Dockerfile.source -t monitor-hub:local .
 
 # 启动
 docker compose up -d
 ```
+
+要一台能扛构建的机器：1 核 1GB 会 OOM，至少 2 核 2GB。构建资源紧张时也可以
+直接推 tag 让 GitHub Actions 在 runner 上编（`Dockerfile` 那条路），拉下来用。
 
 `docker-compose.yml` 已经配好：数据在命名卷 `monitor-data`（挂到 `/data`），
 端口只开在宿主机回环 `127.0.0.1:28080`，内存上限 256M。
@@ -138,6 +141,7 @@ docker compose up -d
 
 | 现象 | 原因 |
 |---|---|
+| `couldn't read \`src/../install.sh\`` | 构建上下文里没有 `install.sh`。hub 用 `include_str!("../install.sh")` 把它嵌进 `/install.sh` 路由，面板生成 agent 安装命令时靠它。改 `Dockerfile.source` 时注意它和 `src/` 一样是必需文件。 |
 | `folder ".../web-admin/dist" does not exist` | 面板没先构建。`Dockerfile.source` 已处理：面板阶段在前，`dist/` 复制进 Rust 阶段后才跑 cargo。 |
 | 流量和到期时间在错误的时刻翻页 | 时区。镜像里带 zoneinfo，删掉它 chrono 会静默退回 UTC。确认 `TZ` 有设置。 |
 | 容器起不来，`exec: "monitor-hub": permission denied` | 二进制丢了执行位。用本仓库的 `Dockerfile.source` 不会出现这个问题（stage 之间复制会保留权限）。 |
